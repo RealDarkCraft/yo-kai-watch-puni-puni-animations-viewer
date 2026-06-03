@@ -81,7 +81,7 @@ class PuniFlashImage:
 
         def toObj(self):
             return {
-                "zorder": self.zorder, # not zorder
+                "groupId": self.groupId,
                 "layer_name": self.layerName,
                 "texture": self.texturePath,
                 "frames": [x.toObj() for x in self.frames],
@@ -90,7 +90,7 @@ class PuniFlashImage:
         def __init__(self, fp):
             self.reader = fp
             self.layerName = self.reader.read_string_16()
-            self.zorder = self.reader.read_uint16()
+            self.groupId = self.reader.read_uint16()
             self.texturePath = self.reader.read_string_16()
             self.frameCount = self.reader.read_uint16()
             self.frames = []
@@ -124,22 +124,24 @@ class PuniFlashImage:
 # ─────────────────────────────────────────────
 
 class TextureCache:
-    def __init__(self, base_dir):
+    def __init__(self, base_dir, datpath):
         self.base_dir = base_dir
+        self.dat_dir = os.path.dirname(datpath)
         self._cache: dict[str, pygame.Surface | None] = {}
 
     def get(self, path: str) -> pygame.Surface | None:
         if path in self._cache:
             return self._cache[path]
-        
+        if path == "":
+            self._cache[path] = None
+            return None
+            
         # we do this currently to test, because we don't know yet how to properly found/search textures
-        if "symbol/" not in path:
-            path = "symbol/" + path
-        candidates = [
-            os.path.join(self.base_dir, path),
-            os.path.join(self.base_dir, os.path.basename(path)),
-            path,
-        ]
+        candidates = [os.path.join(self.dat_dir, path)]
+        #path = path.replace("symbol/", self.symbol)
+        for i in ["data", "event", "gacha", "image", "map", "movie", "particle", "skill", "sound", "youkai", "image\puzzleBoss"]:
+            candidates.append(os.path.join(self.base_dir, path.replace("symbol/", f"{i}/")))
+        found = False
         for c in candidates:
             if os.path.isfile(c):
                 try:
@@ -150,11 +152,12 @@ class TextureCache:
                         "RGBA"
                     ).convert_alpha()
                     self._cache[path] = surf
+                    found = True
                     return surf
                 except Exception as e:
                     print(f"[TextureCache] Cannot load {c}: {e}")
-            else:
-                print(f"[TextureCache] Cannot load {path}")
+        if found == False:
+            print(f"[TextureCache] Cannot load {path}")
         self._cache[path] = None
         return None
 
@@ -169,9 +172,9 @@ ACCENT   = (100, 200, 255)
 TEXT_COL = (220, 220, 230)
 
 class Renderer:
-    def __init__(self, anim: PuniFlashImage, asset_dir: str):
+    def __init__(self, anim: PuniFlashImage, asset_dir: str, symbol: str):
         self.anim = anim
-        self.cache = TextureCache(asset_dir)
+        self.cache = TextureCache(asset_dir, symbol)
         self.frame = 0
         self.total_frames = self._compute_total_frames()
         self.playing = True
@@ -187,6 +190,10 @@ class Renderer:
 
     def _precache_all(self):
         for layer_idx, layer in enumerate(self.anim.layers):
+            if (layer.layerName[0] == "!"):
+                print("Warning : unk layer type")
+            elif (layer.layerName[0] == "%"):
+                print(f"Warning : layer {layer.layerName} is referencing an .split")
             surf = self.cache.get(layer.texturePath)
             if surf is None:
                 continue
@@ -294,32 +301,48 @@ class Renderer:
         with self._lock:
             self.layer_visible[idx] = visible
 
-    def _get_frame_info(self, layer, current_frame):
+    def _get_frame_info(self, layer, current_frame, group_layers):
         best = None
         for fi in layer.frames:
             if fi.frameIndex <= current_frame:
                 if best is None or fi.frameIndex > best.frameIndex:
                     best = fi
-        # Si le frame courant est au-delà du dernier keyframe du layer,
-        # le moteur Flash cache ce layer (pas de keyframe "tenu")
-        # SAUF si le premier keyframe est à 0 — dans ce cas c'est un layer permanent
+
         if best is None:
             return None
+
         last_fi = max(layer.frames, key=lambda f: f.frameIndex)
         if best.frameIndex == last_fi.frameIndex and current_frame > last_fi.frameIndex:
-            # Vérifie si c'est vraiment le dernier keyframe connu et qu'on l'a dépassé
-            # Le layer disparaît seulement si son dernier keyframe n'est pas au max total
-            if layer.zorder < 140 and last_fi.frameIndex < self.total_frames - 1:
-                return None
-            pass
+            if last_fi.frameIndex < self.total_frames - 1:
+                
+                # --- NOUVELLE VÉRIFICATION DU GROUPE ---
+                # On vérifie si AUCUNE couche du groupe n'a encore de frames à afficher.
+                # 'all_finished' sera True si toutes les couches du groupe ont dépassé leur dernière frame.
+                all_finished = True
+                for gl in group_layers:
+                    if gl.frames:  # Sécurité si une couche n'a pas de frames
+                        gl_last = max(gl.frames, key=lambda f: f.frameIndex)
+                        # Si une seule couche du groupe n'a PAS encore dépassé sa dernière frame :
+                        if current_frame <= gl_last.frameIndex:
+                            all_finished = False
+                            break
+                
+                # On ne cache le layer (return None) que si TOUT le groupe est terminé
+                if all_finished:
+                    return None
+                
+                # Sinon, si le groupe est encore actif, on laisse le code continuer 
+                # pour retourner la "best" frame (la dernière frame connue)
+                pass 
+                
         return best
 
-    def _render_layer(self, screen, layer_idx, layer):
+    def _render_layer(self, screen, layer_idx, layer, group_layers):
         with self._lock:
             if not self.layer_visible.get(layer_idx, True):
                 return
 
-        fi = self._get_frame_info(layer, int(self.frame))
+        fi = self._get_frame_info(layer, int(self.frame), group_layers)
         if fi is None:
             return
 
@@ -398,12 +421,12 @@ class Renderer:
                     frame_acc -= steps
 
             screen.fill(BG_COLOR)
-            """sorted_layers = sorted(enumerate(self.anim.layers), key=lambda x: x[1].zorder, reverse=False)
-            sorted_layers.reverse()"""
             sorted_layers = list(enumerate(self.anim.layers))
             sorted_layers.reverse()
+            
             for idx, layer in sorted_layers:
-                self._render_layer(screen, idx, layer)
+                group_layers = [l for l in self.anim.layers if l.groupId == layer.groupId]
+                self._render_layer(screen, idx, layer, group_layers)
 
             self.draw_hud(screen, font_sm)
             pygame.display.flip()
@@ -488,7 +511,7 @@ class ControlPanel:
 
         # Populate layers
         layers = anim.layers if hasattr(anim, 'layers') else []
-        sorted_layers = sorted(enumerate(layers), key=lambda x: x[1].zorder)
+        sorted_layers = list(enumerate(layers))
 
         for idx, layer in sorted_layers:
             self._add_layer_row(idx, layer)
@@ -555,7 +578,7 @@ class ControlPanel:
         info_frame.pack(side="left", fill="x", expand=True)
 
         tk.Label(
-            info_frame, text=f"[z:{layer.zorder:03d}]  {name}",
+            info_frame, text=f"[G:{layer.groupId:03d}]  {name}",
             font=("Courier New", 10, "bold"),
             bg=CHECK_BG, fg=PANEL_FG, anchor="w"
         ).pack(fill="x")
@@ -614,11 +637,13 @@ def main():
         [r"C:\Users\celestin\Downloads\bypasser_v1\assets\image\start\start_ef_resourcedl01_loop.dat", r"C:\Users\celestin\Downloads\bypasser_v1\assets\image\folder"],
         [r"C:\Users\celestin\Downloads\bypasser_v1\assets\image\start\start_ef_resourcedl01_end.dat", r"C:\Users\celestin\Downloads\bypasser_v1\assets\image\folder"],
         [r"C:\Users\celestin\Downloads\bypasser_v1\assets\image\title\title_ef_title_loop01.dat", r"C:\Users\celestin\Downloads\bypasser_v1\assets\image\folder"],
-        [r"C:\Users\celestin\Desktop\ppanimated\skill\skill_91_1_9002651.dat", r"C:\Users\celestin\Desktop\ppanimated\new"],
-        [r"C:\Users\celestin\Desktop\ppanimated\skill\skill_91_1_9002510.dat", r"C:\Users\celestin\Desktop\ppanimated\new"],
-        [r"C:\Users\celestin\Desktop\ppanimated\skill\skill_94_1_9001398.dat", r"C:\Users\celestin\Desktop\ppanimated\new"]
+        [r"C:\Users\celestin\Desktop\puniemu-master\Tools\new_puni_dump\skill\skill_91_1_9002651.dat", r"C:\Users\celestin\Desktop\puniemu-master\Tools\new_puni_dump"],
+        [r"C:\Users\celestin\Desktop\puniemu-master\Tools\new_puni_dump\skill\skill_91_1_9002510.dat", r"C:\Users\celestin\Desktop\puniemu-master\Tools\new_puni_dump"],
+        [r"C:\Users\celestin\Desktop\puniemu-master\Tools\new_puni_dump\skill\skill_94_1_9001398.dat", r"C:\Users\celestin\Desktop\puniemu-master\Tools\new_puni_dump"],
+        [r"C:\Users\celestin\Desktop\puniemu-master\Tools\new_puni_dump\image\title\title_ef_title19_loop01.dat", r"C:\Users\celestin\Desktop\puniemu-master\Tools\new_puni_dump"],
+        [r"C:\Users\celestin\Desktop\puniemu-master\Tools\new_puni_dump\image\union\union_ui_main01.dat", r"C:\Users\celestin\Desktop\puniemu-master\Tools\new_puni_dump"]
     ]
-    example_index = 2
+    example_index = 5
     filepath = lst[example_index][0]
     # Parse animation
     try:
@@ -628,7 +653,7 @@ def main():
         return
 
     asset_dir = os.path.dirname(os.path.abspath(filepath))
-    renderer = Renderer(anim, lst[example_index][1])
+    renderer = Renderer(anim, lst[example_index][1], filepath)
 
     # Run pygame in a separate thread
     pygame_thread = threading.Thread(target=renderer.run, daemon=True)
